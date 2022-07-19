@@ -51,6 +51,8 @@ module Pact.Native
     , atDef
     , chainDataSchema
     , cdChainId, cdBlockHeight, cdBlockTime, cdSender, cdGasLimit, cdGasPrice
+    , describeNamespaceSchema
+    , dnUserGuard, dnAdminGuard, dnNamespaceName
     , cdPrevBlockHash
     ) where
 
@@ -158,7 +160,7 @@ enforceOneDef =
     enforceOne :: NativeFun e
     enforceOne i as@[msg,TList conds _ _] = runReadOnly i $
       gasUnreduced i as $ do
-        msg' <- reduce msg >>= \m -> case m of
+        msg' <- reduce msg >>= \case
           TLitString s -> return s
           _ -> argsError' i as
         let tryCond r@Just {} _ = return r
@@ -385,6 +387,48 @@ fromNamespacePactValue :: Namespace PactValue -> Namespace (Term Name)
 fromNamespacePactValue (Namespace n userg adming) =
   Namespace n (fromGuardPactValue userg) (fromGuardPactValue adming)
 
+dnUserGuard :: FieldKey
+dnUserGuard = "user-guard"
+
+dnAdminGuard :: FieldKey
+dnAdminGuard = "admin-guard"
+
+dnNamespaceName :: FieldKey
+dnNamespaceName = "namespace-name"
+
+describeNamespaceSchema :: NativeDef
+describeNamespaceSchema = defSchema "described-namespace"
+  "Schema type for data returned from 'describe-namespace'."
+  [ (dnUserGuard, tTyGuard Nothing)
+  , (dnAdminGuard, tTyGuard Nothing)
+  , (dnNamespaceName, tTyString)
+  ]
+
+describeNamespaceDef :: NativeDef
+describeNamespaceDef = setTopLevelOnly $ defGasRNative
+  "describe-namespace" describeNamespace
+  (funType (tTyObject dnTy) [("ns", tTyString)])
+  [LitExample "(describe-namespace 'my-namespace)"]
+  "Describe the namespace NS, returning a row object containing \
+  \the user and admin guards of the namespace, as well as its name."
+  where
+    dnTy = TyUser (snd describeNamespaceSchema)
+
+    describeNamespace :: GasRNativeFun e
+    describeNamespace g0 i as = case as of
+      [TLitString nsn] -> do
+        readRow (getInfo i) Namespaces (NamespaceName nsn) >>= \case
+          Just ns@(Namespace nsn' user admin) -> do
+            let guardTermOf g = TGuard (fromPactValue <$> g) def
+
+            computeGas' g0 i (GPostRead (ReadNamespace ns)) $
+              pure $ toTObject dnTy def
+                [ (dnUserGuard, guardTermOf user)
+                , (dnAdminGuard, guardTermOf admin)
+                , (dnNamespaceName, toTerm $ renderCompactText nsn')
+                ]
+          Nothing -> evalError' i $ "Namespace not defined: " <> pretty nsn
+      _ -> argsError i as
 
 defineNamespaceDef :: NativeDef
 defineNamespaceDef = setTopLevelOnly $ defGasRNative "define-namespace" defineNamespace
@@ -474,7 +518,12 @@ namespaceDef = setTopLevelOnly $ defGasRNative "namespace" namespace
         Just n@(Namespace ns' g _) -> do
           nsPactValue <- toNamespacePactValue info n
           computeGas' g0 fa (GPostRead (ReadNamespace nsPactValue)) $ do
-            enforceGuard fa g
+            -- Old behavior enforces ns at declaration.
+            -- New behavior enforces at ns-related action:
+            -- 1. Module install (NOT at module upgrade)
+            -- 2. Interface install (Interfaces non-upgradeable)
+            -- 3. Namespaced keyset definition (once #351 is in)
+            whenExecutionFlagSet FlagPreserveNamespaceUpgrade $ enforceGuard fa g
             success ("Namespace set to " <> (asString ns')) $
               evalRefs . rsNamespace .= (Just n)
         Nothing  -> evalError info $
@@ -772,6 +821,7 @@ langDefs =
     ,intToStrDef
     ,hashDef
     ,defineNamespaceDef
+    ,describeNamespaceDef
     ,namespaceDef
     ,chainDataDef
     ,chainDataSchema
@@ -1253,7 +1303,7 @@ continueNested i as = gasUnreduced i as $ case as of
       (Just ps, Just pe) -> do
         contArgs <- traverse reduce args >>= enforcePactValue'
         let childName = QName (QualifiedName (_dModule d) (asString (_dDefName d)) def)
-            cont = PactContinuation childName contArgs
+            cont = PactContinuation childName (stripPactValueInfo <$> contArgs)
         newPactId <- createNestedPactId i cont (_psPactId ps)
         let newPs = PactStep (_psStep ps) (_psRollback ps) newPactId
         case _peNested pe ^. at newPactId of
