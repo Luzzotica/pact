@@ -40,7 +40,6 @@ pkgs.haskell.packages.${compiler}.developPackage {
         sha256 = "14g2qax1vc7q4g78fa562dviqvcd0l52kd5jmgv90g3g3ci15bnl";
       } {});
 
-      chainweb-api = doJailbreak super.chainweb-api;
       hashable     = doJailbreak super.hashable;
       rebase       = doJailbreak super.rebase;
 
